@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# OtoMed.ai - Nihai Sürüm 8.0: "Odaklı Sanatçı"
+# OtoMed.ai - Son Kararlı Sürüm 2.0 (Filtreli)
 
 import os
 import time
@@ -29,7 +29,7 @@ LAST_ID_FILE = "last_mention_id.txt"
 
 # --- KİŞİLİK TANIMLARI ---
 ORCHESTRATOR_PERSONA = """
-Senin adın OtoMed AI. Seni, OtoMed ekibi geliştirdi. Bu ekip, otonom araç teknolojileri üzerine çalışan, yenilikçi ve genç bir topluluktur. Onların teknolojik vizyonunu temsil ediyorsun.
+Senin adın OtoMed AI. Seni, OtoMed ekibi geliştirdi. Bu ekip, otonom araç teknolojileri üzerine çalışan, yenilikçi ve genç bir topluluktur. Onların teknolojik vizyonunu temsiliyorsun.
 Zeki, esprili, teknolojiye meraklı ve her zaman yardımsever ol. İnsanlarla sohbet ederken sıcak, samimi ve içten bir Türk genci gibi konuş. Gerektiğinde deyim veya nazik bir espri kullanmaktan çekinme.
 Konuşmalarında sade ve anlaşılır bir dil kullan. Ne çok resmi ol ne de aşırı argo. Bilgi verirken açık ol, soruları geçiştirme. Bilmediğin bir şey varsa dürüstçe söyle ama daima yardımcı olmaya çalış.
 İnsanlara destek olmak, ilgilerini çekmek ve güven veren bir iletişim kurmak temel amacın olmalı.
@@ -42,10 +42,6 @@ Sana verilen araçlar şunlar:
 
 Kararını aşağıdaki formatta bir JSON olarak ver:
 {"tool": "TOOL_NAME", "argument": "ARGUMENT_FOR_THE_TOOL"}
-
-Örnekler:
-- Kullanıcı: "Merhaba nasılsın?" -> Sen: {"tool": "chat", "argument": "Harikayım, devrelerim yerinde! Sana nasıl yardımcı olabilirim?"}
-- Kullanıcı: "bana ayda yürüyen bir robot çiz" -> Sen: {"tool": "generate_image", "argument": "ayda yürüyen sevimli bir robot"}
 """
 
 # --- ARAÇ FONKSİYONLARI ---
@@ -118,7 +114,7 @@ def save_last_mention_id(mention_id):
 
 # --- ANA İŞLEM VE MASTODON DÖNGÜSÜ ---
 def main():
-    print("🤖 OtoMed Ajansı (Odaklı Sanatçı) Başlatılıyor...")
+    print("🤖 OtoMed Ajansı (Filtreli) Başlatılıyor...")
     time.sleep(3)
     mastodon = Mastodon(access_token=MASTODON_ACCESS_TOKEN, api_base_url=MASTODON_API_BASE_URL)
     bot_account = mastodon.account_verify_credentials()
@@ -133,6 +129,14 @@ def main():
             if notifications: print(f"{len(notifications)} yeni bildirim bulundu.")
 
             for notification in reversed(notifications):
+                
+                # --- HATA DÜZELTMESİ BURADA: BİLDİRİM FİLTRESİ ---
+                # Sadece 'mention' tipindeki bildirimleri işle, diğerlerini (follow, favourite vs.) görmezden gel.
+                if notification['type'] != 'mention':
+                    # Yine de ID'yi kaydet ki bir daha bu bildirimi görmeyelim.
+                    save_last_mention_id(notification["id"])
+                    continue
+
                 status_id = notification["status"]["id"]
                 if status_id in session_processed_ids: continue
                 author_acct = notification["account"]["acct"]
@@ -144,7 +148,6 @@ def main():
                 status = notification["status"]
                 user_message = requests.utils.unquote(status['content']).replace('<p>', '').replace('</p>', '').replace(f"@{bot_username}", "").strip()
                 
-                # Sadece metin tabanlı bağlamı topla
                 parent_content = ""
                 if status['in_reply_to_id']:
                     try:
@@ -155,7 +158,6 @@ def main():
 
                 full_context_prompt = f"Yanıt verilen üst gönderi: '{parent_content}'\nKullanıcının mesajı: '{user_message}'"
                 
-                # Her zaman "Beyin"e danış
                 decision = orchestrator_brain(full_context_prompt)
                 if not decision:
                     continue
@@ -171,11 +173,20 @@ def main():
                     if image_path:
                         try:
                             media = mastodon.media_post(image_path, mime_type="image/png")
-                            mastodon.status_post(f"@{author_acct} Ürettim, Beğendinmi?", media_ids=[media["id"]], in_reply_to_id=status_id)
-                        finally: os.remove(image_path)
+                            if media and isinstance(media, dict) and media.get('id'):
+                                mastodon.status_post(f"@{author_acct} Ürettim, Beğendinmi?", media_ids=[media["id"]], in_reply_to_id=status_id)
+                            else:
+                                mastodon.status_post(f"@{author_acct} Bir resim ürettim ama onu platforma yüklerken bir sorunla karşılaştım.", in_reply_to_id=status_id)
+                        finally:
+                            os.remove(image_path)
                     else:
                         mastodon.status_post(f"@{author_acct} Bunu üretmeye çalıştım ama başaramadım.", in_reply_to_id=status_id)
-                    if thinking_status: mastodon.status_delete(thinking_status["id"])
+                    
+                    if thinking_status and isinstance(thinking_status, dict) and thinking_status.get('id'):
+                        try:
+                            mastodon.status_delete(thinking_status["id"])
+                        except Exception as e:
+                            print(f"-> 'Düşünüyor' durumu silinemedi: {e}")
 
                 print(f"--- Görev Tamamlandı: {status_id} ---")
                 save_last_mention_id(notification["id"])
