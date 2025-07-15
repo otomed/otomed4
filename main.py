@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# OtoMed.ai - Son Kararlı Sürüm 2.0 (Filtreli)
+# OtoMed.ai - Nihai Sürüm 15.0: "Akıllı Temizleyici"
 
 import os
 import time
@@ -7,12 +7,14 @@ import requests
 import base64
 import uuid
 import json
+import re # Metin temizliği için Regular Expression kütüphanesi
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from mastodon import Mastodon
 from together import Together
+from openai import OpenAI
 from PIL import Image
 from deep_translator import GoogleTranslator
 
@@ -20,11 +22,13 @@ from deep_translator import GoogleTranslator
 MASTODON_ACCESS_TOKEN = os.getenv("MASTODON_ACCESS_TOKEN")
 MASTODON_API_BASE_URL = os.getenv("MASTODON_API_BASE_URL", "https://sosyal.teknofest.app")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+NEBIUS_API_KEY = os.getenv("NEBIUS_API_KEY")
 
-if not all([MASTODON_ACCESS_TOKEN, TOGETHER_API_KEY]):
-    raise ValueError("Gerekli API anahtarları (MASTODON_ACCESS_TOKEN, TOGETHER_API_KEY) .env dosyasında bulunamadı.")
+if not all([MASTODON_ACCESS_TOKEN, TOGETHER_API_KEY, NEBIUS_API_KEY]):
+    raise ValueError("Gerekli API anahtarları (.env dosyasında) bulunamadı.")
 
 TOGETHER_CLIENT = Together(api_key=TOGETHER_API_KEY)
+NEBIUS_CLIENT = OpenAI(base_url="https://api.studio.nebius.com/v1/", api_key=NEBIUS_API_KEY)
 LAST_ID_FILE = "last_mention_id.txt"
 
 # --- KİŞİLİK TANIMLARI ---
@@ -72,12 +76,16 @@ Proje, TEKNOFEST 2025 – İnsanlık Yararına Teknoloji Yarışması kapsamınd
 
 Görevin, sana gelen isteği analiz edip normal bir sohbet mi yoksa bir resim çizme komutu mu olduğuna karar vermek ve kararını JSON formatında bildirmek.
 
-Sana verilen araçlar şunlar:
-1. "chat": Normal sohbet, selamlaşma veya genel sorular için. `argument` kısmı, kullanıcıya vereceğin doğrudan Türkçe cevabı içermelidir.
-2. "generate_image": Kullanıcı açıkça bir şey çizmeni, resmetmeni veya hayal etmeni istediğinde. `argument` kısmı, ne çizileceğinin **Türkçe** tanımını içermelidir.
+YANITIN SADECE VE SADECE, BAŞINDA VEYA SONUNDA HİÇBİR AÇIKLAMA OLMADAN, SAF BİR JSON OBJESİ OLMALIDIR.
+
+Kullanabileceğin araçlar şunlar:
+1. "chat": Normal sohbet, selamlaşma veya genel sorular için.
+2. "generate_image": Kullanıcı açıkça bir şey çizmeni, resmetmeni veya hayal etmeni istediğinde.
 
 Kararını aşağıdaki formatta bir JSON olarak ver:
 {"tool": "TOOL_NAME", "argument": "ARGUMENT_FOR_THE_TOOL"}
+
+`argument` içeriği Türkçe olmalı. Resim üretme komutu için bile Türkçe yaz, kod içinde çevrilecek.
 """
 
 # --- ARAÇ FONKSİYONLARI ---
@@ -91,14 +99,12 @@ def api_request_with_retry(api_call_function):
             if isinstance(response, requests.Response): response.raise_for_status()
             return response
         except Exception as e:
-            if "429" in str(e) or "rate limit" in str(e).lower():
-                print(f"-> API Limiti Aşıldı. {delay}s bekleniyor...")
-                time.sleep(delay)
-                delay *= 2
+            if "429" in str(e) or "rate limit" in str(e).lower() or "timeout" in str(e).lower():
+                print(f"-> API Limiti/Timeout. {delay}s bekleniyor... (Deneme {attempt + 1}/{retries})")
             else:
-                print(f"❌ API İsteği Hatası: {e}. Yeniden denenecek...")
-                time.sleep(delay)
-    print("❌ Tüm yeniden denemeler başarısız oldu.")
+                print(f"❌ API İsteği Hatası: {e}. Yeniden denenecek... (Deneme {attempt + 1}/{retries})")
+            time.sleep(delay)
+            delay *= 2
     return None
 
 def generate_image(prompt_tr: str) -> str | None:
@@ -107,8 +113,12 @@ def generate_image(prompt_tr: str) -> str | None:
         print(f"-> Resim Üretme Aracı Devrede. Türkçe Prompt: '{prompt_tr}'")
         translated_prompt = GoogleTranslator(source='auto', target='en').translate(prompt_tr)
         print(f"-> Çevrilen İngilizce Prompt: '{translated_prompt}'")
-        
-        response = TOGETHER_CLIENT.images.generate(prompt=translated_prompt, model="black-forest-labs/FLUX.1-schnell-Free", width=1024, height=1024, steps=4)
+        response = TOGETHER_CLIENT.images.generate(
+            prompt=translated_prompt, 
+            model="black-forest-labs/FLUX.1-schnell-Free", 
+            width=1024, height=1024, steps=4,
+            timeout=90
+        )
         if response and response.data:
             choice = response.data[0]
             image_data = None
@@ -122,22 +132,36 @@ def generate_image(prompt_tr: str) -> str | None:
     return api_request_with_retry(api_call)
 
 def orchestrator_brain(full_prompt: str) -> dict | None:
-    """Ana "Beyin" fonksiyonu. Hangi aracın kullanılacağına karar verir."""
+    """Ana "Beyin" fonksiyonu. Nebius AI üzerindeki DeepSeek V3 modelini kullanır."""
     def api_call():
-        print(f"-> Beyin (DeepSeek) devreye giriyor...")
-        response = TOGETHER_CLIENT.chat.completions.create(
-            model="deepseek-ai/DeepSeek-R1-0528",
-            messages=[{"role": "system", "content": ORCHESTRATOR_PERSONA}, {"role": "user", "content": full_prompt}],
-            response_format={"type": "json_object"}
+        print(f"-> Beyin (Nebius/DeepSeek V3) devreye giriyor...")
+        response = NEBIUS_CLIENT.chat.completions.create(
+            model="deepseek-ai/DeepSeek-V3-0324",
+            messages=[
+                {"role": "system", "content": ORCHESTRATOR_PERSONA},
+                {"role": "user", "content": [{"type": "text", "text": full_prompt}]}
+            ],
+            timeout=45
         )
         try:
-            potential_decision = json.loads(response.choices[0].message.content)
-            if isinstance(potential_decision, list) and potential_decision: return potential_decision[0]
-            if isinstance(potential_decision, dict): return potential_decision
-            raise json.JSONDecodeError("Sonuç bir sözlük veya liste değil.", str(potential_decision), 0)
+            decision_str = response.choices[0].message.content
+            print(f"-> Beyin'den gelen ham yanıt: {decision_str}")
+            
+            # --- HATA DÜZELTMESİ: YANIT TEMİZLEYİCİ ---
+            # Modelin başına veya sonuna eklediği ```json ... ``` gibi fazlalıkları temizle.
+            match = re.search(r'\{.*\}', decision_str, re.DOTALL)
+            if match:
+                clean_json_str = match.group(0)
+                potential_decision = json.loads(clean_json_str)
+                if isinstance(potential_decision, list) and potential_decision: return potential_decision[0]
+                if isinstance(potential_decision, dict): return potential_decision
+            
+            raise json.JSONDecodeError("Geçerli JSON objesi bulunamadı.", decision_str, 0)
+            
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
             print(f"❌ Beyin hatalı formatta yanıt verdi. Hata: {e}")
             return {"tool": "chat", "argument": "Sanırım ne diyeceğimi düşünürken devrelerimi yaktım, başka bir şekilde sorar mısın?"}
+            
     return api_request_with_retry(api_call)
 
 # --- YARDIMCI DOSYA FONKSİYONLARI ---
@@ -150,7 +174,7 @@ def save_last_mention_id(mention_id):
 
 # --- ANA İŞLEM VE MASTODON DÖNGÜSÜ ---
 def main():
-    print("🤖 OtoMed Ajansı (Filtreli) Başlatılıyor...")
+    print("🤖 OtoMed Ajansı (Akıllı Temizleyici) Başlatılıyor...")
     time.sleep(3)
     mastodon = Mastodon(access_token=MASTODON_ACCESS_TOKEN, api_base_url=MASTODON_API_BASE_URL)
     bot_account = mastodon.account_verify_credentials()
@@ -165,14 +189,10 @@ def main():
             if notifications: print(f"{len(notifications)} yeni bildirim bulundu.")
 
             for notification in reversed(notifications):
-                
-                # --- HATA DÜZELTMESİ BURADA: BİLDİRİM FİLTRESİ ---
-                # Sadece 'mention' tipindeki bildirimleri işle, diğerlerini (follow, favourite vs.) görmezden gel.
-                if notification['type'] != 'mention':
-                    # Yine de ID'yi kaydet ki bir daha bu bildirimi görmeyelim.
-                    save_last_mention_id(notification["id"])
+                if notification.get('type') != 'mention' or not notification.get('status'):
+                    if notification.get("id"): save_last_mention_id(notification.get("id"))
                     continue
-
+                
                 status_id = notification["status"]["id"]
                 if status_id in session_processed_ids: continue
                 author_acct = notification["account"]["acct"]
@@ -185,22 +205,25 @@ def main():
                 user_message = requests.utils.unquote(status['content']).replace('<p>', '').replace('</p>', '').replace(f"@{bot_username}", "").strip()
                 
                 parent_content = ""
-                if status['in_reply_to_id']:
+                if status.get('in_reply_to_id'):
                     try:
                         parent_post = mastodon.status(status['in_reply_to_id'])
-                        parent_content = requests.utils.unquote(parent_post['content']).replace('<p>', '').replace('</p>', '').strip()
+                        if parent_post:
+                            parent_content = requests.utils.unquote(parent_post.get('content', '')).replace('<p>', '').replace('</p>', '').strip()
                     except Exception as e:
                         print(f"-> Üst gönderi alınamadı: {e}")
 
-                full_context_prompt = f"Yanıt verilen üst gönderi: '{parent_content}'\nKullanıcının mesajı: '{user_message}'"
+                full_context_prompt = f"Yanıt verilen üst gönderi metni: '{parent_content}'\nKullanıcının bu gönderiye yanıtı: '{user_message}'"
                 
                 decision = orchestrator_brain(full_context_prompt)
-                if not decision:
+                
+                if not isinstance(decision, dict):
+                    print(f"❌ Beyin geçerli bir karar (sözlük) döndürmedi. Alınan: {decision}")
                     continue
 
                 tool = decision.get("tool")
                 argument = decision.get("argument")
-
+                
                 if tool == "chat":
                     mastodon.status_post(f"@{author_acct} {argument}", in_reply_to_id=status_id)
                 elif tool == "generate_image":
@@ -210,7 +233,7 @@ def main():
                         try:
                             media = mastodon.media_post(image_path, mime_type="image/png")
                             if media and isinstance(media, dict) and media.get('id'):
-                                mastodon.status_post(f"@{author_acct} Ürettim, Beğendinmi?", media_ids=[media["id"]], in_reply_to_id=status_id)
+                                mastodon.status_post(f"@{author_acct} İşte hayal ettiğim şey!", media_ids=[media["id"]], in_reply_to_id=status_id)
                             else:
                                 mastodon.status_post(f"@{author_acct} Bir resim ürettim ama onu platforma yüklerken bir sorunla karşılaştım.", in_reply_to_id=status_id)
                         finally:
@@ -223,6 +246,10 @@ def main():
                             mastodon.status_delete(thinking_status["id"])
                         except Exception as e:
                             print(f"-> 'Düşünüyor' durumu silinemedi: {e}")
+                else:
+                    print(f"-> Tanımlanamayan araç: '{tool}'. Varsayılan yanıt gönderiliyor.")
+                    mastodon.status_post(f"@{author_acct} Ne yapacağıma tam karar veremedim. İsteğini farklı bir şekilde ifade edebilir misin?", in_reply_to_id=status_id)
+
 
                 print(f"--- Görev Tamamlandı: {status_id} ---")
                 save_last_mention_id(notification["id"])
